@@ -103,6 +103,7 @@ ALTER PROCEDURE
     @include_maintenance bit = 0, /*Set this bit to 1 to add maintenance operations such as index creation to the result set*/
     @find_high_impact bit = 0, /*finds the vital few queries consuming disproportionate resources across cpu, duration, reads, writes, memory, and executions*/
     @primary_window nvarchar(20) = NULL, /*with @find_high_impact, restricts results to queries whose majority activity is in this window: business, off-hours, or weekend*/
+    @include_ai_prompt bit = 0, /*generates a boilerplate AI prompt with statistics, query text, and query plan for LLM performance analysis*/
     @help bit = 0, /*return available parameter details, etc.*/
     @debug bit = 0, /*prints dynamic sql, statement length, parameter and variable values, and raw temp table contents*/
     @troubleshoot_performance bit = 0, /*set statistics xml on for queries against views*/
@@ -206,6 +207,7 @@ BEGIN
                 WHEN N'@include_maintenance' THEN N'Set this bit to 1 to add maintenance operations such as index creation to the result set'
                 WHEN N'@find_high_impact' THEN N'finds the vital few queries consuming disproportionate resources across cpu, duration, reads, writes, memory, and executions'
                 WHEN N'@primary_window' THEN N'with @find_high_impact, restricts results to queries whose majority activity is in this window (business, off-hours, or weekend)'
+                WHEN N'@include_ai_prompt' THEN N'generates a boilerplate AI prompt containing intent, performance statistics, query text, and query plan for LLM performance analysis'
                 WHEN N'@help' THEN 'how you got here'
                 WHEN N'@debug' THEN 'prints dynamic sql, statement length, parameter and variable values, and raw temp table contents'
                 WHEN N'@troubleshoot_performance' THEN 'set statistics xml on for queries against views'
@@ -269,6 +271,7 @@ BEGIN
                 WHEN N'@include_maintenance' THEN N'0 or 1'
                 WHEN N'@find_high_impact' THEN N'0 or 1'
                 WHEN N'@primary_window' THEN N'business, off-hours, or weekend (any unambiguous prefix works: b, biz, off, overnight, w, wknd, etc.)'
+                WHEN N'@include_ai_prompt' THEN N'0 or 1'
                 WHEN N'@help' THEN '0 or 1'
                 WHEN N'@debug' THEN '0 or 1'
                 WHEN N'@troubleshoot_performance' THEN '0 or 1'
@@ -332,6 +335,7 @@ BEGIN
                 WHEN N'@include_maintenance' THEN N'0'
                 WHEN N'@find_high_impact' THEN N'0'
                 WHEN N'@primary_window' THEN N'NULL'
+                WHEN N'@include_ai_prompt' THEN N'0'
                 WHEN N'@help' THEN '0'
                 WHEN N'@debug' THEN '0'
                 WHEN N'@troubleshoot_performance' THEN '0'
@@ -782,6 +786,20 @@ AND @find_high_impact = 1
 )
 BEGIN
     RAISERROR('@log_to_table cannot be used with @find_high_impact. Run them separately.', 11, 1) WITH NOWAIT;
+    RETURN;
+END;
+
+/*
+@include_ai_prompt can't be used with @find_high_impact
+because @find_high_impact takes a completely separate code path
+*/
+IF
+(
+    @include_ai_prompt = 1
+AND @find_high_impact = 1
+)
+BEGIN
+    RAISERROR('@include_ai_prompt cannot be used with @find_high_impact. Run them separately.', 11, 1) WITH NOWAIT;
     RETURN;
 END;
 
@@ -12068,6 +12086,90 @@ FROM
     /* Append the column SQL to the main SQL */
     SELECT
         @sql += @column_sql;
+
+    /*
+    Append the AI prompt column when requested.
+    The comma is required here because the trailing comma was stripped from @column_sql.
+    This column is excluded from the @log_to_table path intentionally — the prompt
+    text is too large to be useful in a logging table and would inflate storage.
+    Wait stats (w.top_waits) are only referenced in dynamic SQL when @new = 1,
+    so we branch the SQL fragment at build time using CASE WHEN @new = 1.
+    The prompt is returned as XML so that SSMS renders it as a clickable hyperlink,
+    which opens in the XML viewer and preserves all line breaks and formatting.
+    */
+    IF @include_ai_prompt = 1
+    AND @log_to_table = 0
+    BEGIN
+        SELECT
+            @sql +=
+            CONVERT
+            (
+                nvarchar(max),
+                N',
+        ai_prompt =
+        (
+            SELECT
+                [text()] =
+                    CONVERT(nvarchar(max), N''# SQL Server Query Performance Analysis'') +
+                    NCHAR(13) + NCHAR(10) + NCHAR(13) + NCHAR(10) +
+                    N''You are a Microsoft SQL Server performance expert. A database administrator has identified the following query as a performance concern using sp_QuickieStore with historical query statistics. Please analyze the performance statistics and execution plan below, identify the root causes of the bottleneck, and suggest the most impactful changes to improve query performance.'' +
+                    NCHAR(13) + NCHAR(10) + NCHAR(13) + NCHAR(10) +
+                    N''## Query Context'' + NCHAR(13) + NCHAR(10) + NCHAR(13) + NCHAR(10) +
+                    N''**Database:** '' + DB_NAME(qsrs.database_id) + NCHAR(13) + NCHAR(10) +
+                    N''**Object Name:** '' + qsq.object_name + NCHAR(13) + NCHAR(10) +
+                    N''**Compatibility Level:** '' + CONVERT(nvarchar(10), qsp.compatibility_level) + NCHAR(13) + NCHAR(10) +
+                    NCHAR(13) + NCHAR(10) +
+                    N''## Performance Statistics'' + NCHAR(13) + NCHAR(10) + NCHAR(13) + NCHAR(10) +
+                    N''**Executions:** '' + CONVERT(nvarchar(20), qsrs.count_executions) + NCHAR(13) + NCHAR(10) +
+                    N''**First Execution:** '' + CONVERT(nvarchar(50), qsrs.first_execution_time, 127) + NCHAR(13) + NCHAR(10) +
+                    N''**Last Execution:** '' + CONVERT(nvarchar(50), qsrs.last_execution_time, 127) + NCHAR(13) + NCHAR(10) +
+                    N''**Avg Duration (ms):** '' + ISNULL(CONVERT(nvarchar(30), CONVERT(decimal(19,2), qsrs.avg_duration_ms)), N''N/A'') + NCHAR(13) + NCHAR(10) +
+                    N''**Max Duration (ms):** '' + CONVERT(nvarchar(20), qsrs.max_duration_ms) + NCHAR(13) + NCHAR(10) +
+                    N''**Avg CPU Time (ms):** '' + ISNULL(CONVERT(nvarchar(30), CONVERT(decimal(19,2), qsrs.avg_cpu_time_ms)), N''N/A'') + NCHAR(13) + NCHAR(10) +
+                    N''**Max CPU Time (ms):** '' + CONVERT(nvarchar(20), qsrs.max_cpu_time_ms) + NCHAR(13) + NCHAR(10) +
+                    N''**Avg Logical Reads (MB):** '' + ISNULL(CONVERT(nvarchar(30), CONVERT(decimal(19,2), qsrs.avg_logical_io_reads_mb)), N''N/A'') + NCHAR(13) + NCHAR(10) +
+                    N''**Max Logical Reads (MB):** '' + CONVERT(nvarchar(20), qsrs.max_logical_io_reads_mb) + NCHAR(13) + NCHAR(10) +
+                    N''**Avg Logical Writes (MB):** '' + ISNULL(CONVERT(nvarchar(30), CONVERT(decimal(19,2), qsrs.avg_logical_io_writes_mb)), N''N/A'') + NCHAR(13) + NCHAR(10) +
+                    N''**Avg Physical Reads (MB):** '' + ISNULL(CONVERT(nvarchar(30), CONVERT(decimal(19,2), qsrs.avg_physical_io_reads_mb)), N''N/A'') + NCHAR(13) + NCHAR(10) +
+                    N''**Avg Memory Used (MB):** '' + ISNULL(CONVERT(nvarchar(30), CONVERT(decimal(19,2), qsrs.avg_query_max_used_memory_mb)), N''N/A'') + NCHAR(13) + NCHAR(10) +
+                    N''**Avg Rows Returned:** '' + ISNULL(CONVERT(nvarchar(30), CONVERT(decimal(19,2), qsrs.avg_rowcount)), N''N/A'') + NCHAR(13) + NCHAR(10) +
+                    N''**Min DOP:** '' + CONVERT(nvarchar(10), qsrs.min_dop) + NCHAR(13) + NCHAR(10) +
+                    N''**Max DOP:** '' + CONVERT(nvarchar(10), qsrs.max_dop) + NCHAR(13) + NCHAR(10) +
+                    NCHAR(13) + NCHAR(10) +
+                    N''## Wait Statistics'' + NCHAR(13) + NCHAR(10) + NCHAR(13) + NCHAR(10) +'
+            ) +
+            CASE
+                WHEN @new = 1
+                THEN CONVERT
+                     (
+                         nvarchar(max),
+                         N'                    ISNULL(w.top_waits, N''None recorded'') + NCHAR(13) + NCHAR(10) +
+                    NCHAR(13) + NCHAR(10) +'
+                     )
+                ELSE CONVERT
+                     (
+                         nvarchar(max),
+                         N'                    N''Not available (SQL Server pre-2017)'' + NCHAR(13) + NCHAR(10) +
+                    NCHAR(13) + NCHAR(10) +'
+                     )
+            END +
+            CONVERT
+            (
+                nvarchar(max),
+                N'                    N''## Query Text'' + NCHAR(13) + NCHAR(10) + NCHAR(13) + NCHAR(10) +
+                    N''```sql'' + NCHAR(13) + NCHAR(10) +
+                    ISNULL(CONVERT(nvarchar(max), qsqt.query_sql_text), N''N/A'') + NCHAR(13) + NCHAR(10) +
+                    N''```'' + NCHAR(13) + NCHAR(10) + NCHAR(13) + NCHAR(10) +
+                    N''## Query Plan (XML)'' + NCHAR(13) + NCHAR(10) + NCHAR(13) + NCHAR(10) +
+                    N''```xml'' + NCHAR(13) + NCHAR(10) +
+                    ISNULL(qsp.query_plan, N''N/A'') + NCHAR(13) + NCHAR(10) +
+                    N''```''
+            FOR XML
+                PATH(''''),
+                TYPE
+        )'
+            );
+    END;
 
     /*
     Add on the from and stuff
