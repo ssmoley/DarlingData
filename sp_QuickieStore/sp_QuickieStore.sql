@@ -11999,9 +11999,102 @@ FROM
                              TYPE
                      )
              END,
-        qsp.compatibility_level,
 '
         );
+
+    /*
+    Insert ai_prompt between query_plan and compatibility_level when requested.
+    The prompt is returned as XML so that SSMS renders it as a clickable hyperlink,
+    which opens in the XML viewer and preserves all line breaks and formatting.
+    Wait stats (w.top_waits) are only referenced in dynamic SQL when @new = 1,
+    so we branch the SQL fragment at build time using CASE WHEN @new = 1.
+    This column is excluded from the @log_to_table path intentionally — the prompt
+    text is too large to be useful in a logging table and would inflate storage.
+    When @include_ai_prompt = 0, qsp.compatibility_level is appended directly.
+    */
+    IF @include_ai_prompt = 1
+    AND @log_to_table = 0
+    BEGIN
+        SELECT
+            @sql +=
+            CONVERT
+            (
+                nvarchar(max),
+                N'        ai_prompt =
+        (
+            SELECT
+                [text()] =
+                    CONVERT(nvarchar(max), N''# SQL Server Query Performance Analysis'') +
+                    NCHAR(13) + NCHAR(10) + NCHAR(13) + NCHAR(10) +
+                    N''You are a Microsoft SQL Server performance expert. A database administrator has identified the following query as a performance concern using sp_QuickieStore with historical query statistics. Please analyze the performance statistics and execution plan below, identify the root causes of the bottleneck, and suggest the most impactful changes to improve query performance.'' +
+                    NCHAR(13) + NCHAR(10) + NCHAR(13) + NCHAR(10) +
+                    N''## Query Context'' + NCHAR(13) + NCHAR(10) + NCHAR(13) + NCHAR(10) +
+                    N''**Database:** '' + DB_NAME(qsrs.database_id) + NCHAR(13) + NCHAR(10) +
+                    N''**Object Name:** '' + qsq.object_name + NCHAR(13) + NCHAR(10) +
+                    N''**Compatibility Level:** '' + CONVERT(nvarchar(10), qsp.compatibility_level) + NCHAR(13) + NCHAR(10) +
+                    NCHAR(13) + NCHAR(10) +
+                    N''## Performance Statistics'' + NCHAR(13) + NCHAR(10) + NCHAR(13) + NCHAR(10) +
+                    N''**Executions:** '' + CONVERT(nvarchar(20), qsrs.count_executions) + NCHAR(13) + NCHAR(10) +
+                    N''**First Execution:** '' + CONVERT(nvarchar(50), qsrs.first_execution_time, 127) + NCHAR(13) + NCHAR(10) +
+                    N''**Last Execution:** '' + CONVERT(nvarchar(50), qsrs.last_execution_time, 127) + NCHAR(13) + NCHAR(10) +
+                    N''**Avg Duration (ms):** '' + ISNULL(CONVERT(nvarchar(30), CONVERT(decimal(19,2), qsrs.avg_duration_ms)), N''N/A'') + NCHAR(13) + NCHAR(10) +
+                    N''**Max Duration (ms):** '' + CONVERT(nvarchar(20), qsrs.max_duration_ms) + NCHAR(13) + NCHAR(10) +
+                    N''**Avg CPU Time (ms):** '' + ISNULL(CONVERT(nvarchar(30), CONVERT(decimal(19,2), qsrs.avg_cpu_time_ms)), N''N/A'') + NCHAR(13) + NCHAR(10) +
+                    N''**Max CPU Time (ms):** '' + CONVERT(nvarchar(20), qsrs.max_cpu_time_ms) + NCHAR(13) + NCHAR(10) +
+                    N''**Avg Logical Reads (MB):** '' + ISNULL(CONVERT(nvarchar(30), CONVERT(decimal(19,2), qsrs.avg_logical_io_reads_mb)), N''N/A'') + NCHAR(13) + NCHAR(10) +
+                    N''**Max Logical Reads (MB):** '' + CONVERT(nvarchar(20), qsrs.max_logical_io_reads_mb) + NCHAR(13) + NCHAR(10) +
+                    N''**Avg Logical Writes (MB):** '' + ISNULL(CONVERT(nvarchar(30), CONVERT(decimal(19,2), qsrs.avg_logical_io_writes_mb)), N''N/A'') + NCHAR(13) + NCHAR(10) +
+                    N''**Avg Physical Reads (MB):** '' + ISNULL(CONVERT(nvarchar(30), CONVERT(decimal(19,2), qsrs.avg_physical_io_reads_mb)), N''N/A'') + NCHAR(13) + NCHAR(10) +
+                    N''**Avg Memory Used (MB):** '' + ISNULL(CONVERT(nvarchar(30), CONVERT(decimal(19,2), qsrs.avg_query_max_used_memory_mb)), N''N/A'') + NCHAR(13) + NCHAR(10) +
+                    N''**Avg Rows Returned:** '' + ISNULL(CONVERT(nvarchar(30), CONVERT(decimal(19,2), qsrs.avg_rowcount)), N''N/A'') + NCHAR(13) + NCHAR(10) +
+                    N''**Min DOP:** '' + CONVERT(nvarchar(10), qsrs.min_dop) + NCHAR(13) + NCHAR(10) +
+                    N''**Max DOP:** '' + CONVERT(nvarchar(10), qsrs.max_dop) + NCHAR(13) + NCHAR(10) +
+                    NCHAR(13) + NCHAR(10) +
+                    N''## Wait Statistics'' + NCHAR(13) + NCHAR(10) + NCHAR(13) + NCHAR(10) +'
+            ) +
+            CASE
+                WHEN @new = 1
+                THEN CONVERT
+                     (
+                         nvarchar(max),
+                         N'                    ISNULL(w.top_waits, N''None recorded'') + NCHAR(13) + NCHAR(10) +
+                    NCHAR(13) + NCHAR(10) +'
+                     )
+                ELSE CONVERT
+                     (
+                         nvarchar(max),
+                         N'                    N''Not available (SQL Server pre-2017)'' + NCHAR(13) + NCHAR(10) +
+                    NCHAR(13) + NCHAR(10) +'
+                     )
+            END +
+            CONVERT
+            (
+                nvarchar(max),
+                N'                    N''## Query Text'' + NCHAR(13) + NCHAR(10) + NCHAR(13) + NCHAR(10) +
+                    N''```sql'' + NCHAR(13) + NCHAR(10) +
+                    ISNULL(CONVERT(nvarchar(max), qsqt.query_sql_text), N''N/A'') + NCHAR(13) + NCHAR(10) +
+                    N''```'' + NCHAR(13) + NCHAR(10) + NCHAR(13) + NCHAR(10) +
+                    N''## Query Plan (XML)'' + NCHAR(13) + NCHAR(10) + NCHAR(13) + NCHAR(10) +
+                    N''```xml'' + NCHAR(13) + NCHAR(10) +
+                    ISNULL(qsp.query_plan, N''N/A'') + NCHAR(13) + NCHAR(10) +
+                    N''```''
+            FOR XML
+                PATH(''''),
+                TYPE
+        ),
+        qsp.compatibility_level,'
+            );
+    END;
+    ELSE
+    BEGIN
+        SELECT
+            @sql +=
+            CONVERT
+            (
+                nvarchar(max),
+                N'        qsp.compatibility_level,'
+            );
+    END;
 
     /* Build column list according to mode (expert vs. non-expert) and format_output */
     SELECT
@@ -12086,90 +12179,6 @@ FROM
     /* Append the column SQL to the main SQL */
     SELECT
         @sql += @column_sql;
-
-    /*
-    Append the AI prompt column when requested.
-    The comma is required here because the trailing comma was stripped from @column_sql.
-    This column is excluded from the @log_to_table path intentionally — the prompt
-    text is too large to be useful in a logging table and would inflate storage.
-    Wait stats (w.top_waits) are only referenced in dynamic SQL when @new = 1,
-    so we branch the SQL fragment at build time using CASE WHEN @new = 1.
-    The prompt is returned as XML so that SSMS renders it as a clickable hyperlink,
-    which opens in the XML viewer and preserves all line breaks and formatting.
-    */
-    IF @include_ai_prompt = 1
-    AND @log_to_table = 0
-    BEGIN
-        SELECT
-            @sql +=
-            CONVERT
-            (
-                nvarchar(max),
-                N',
-        ai_prompt =
-        (
-            SELECT
-                [text()] =
-                    CONVERT(nvarchar(max), N''# SQL Server Query Performance Analysis'') +
-                    NCHAR(13) + NCHAR(10) + NCHAR(13) + NCHAR(10) +
-                    N''You are a Microsoft SQL Server performance expert. A database administrator has identified the following query as a performance concern using sp_QuickieStore with historical query statistics. Please analyze the performance statistics and execution plan below, identify the root causes of the bottleneck, and suggest the most impactful changes to improve query performance.'' +
-                    NCHAR(13) + NCHAR(10) + NCHAR(13) + NCHAR(10) +
-                    N''## Query Context'' + NCHAR(13) + NCHAR(10) + NCHAR(13) + NCHAR(10) +
-                    N''**Database:** '' + DB_NAME(qsrs.database_id) + NCHAR(13) + NCHAR(10) +
-                    N''**Object Name:** '' + qsq.object_name + NCHAR(13) + NCHAR(10) +
-                    N''**Compatibility Level:** '' + CONVERT(nvarchar(10), qsp.compatibility_level) + NCHAR(13) + NCHAR(10) +
-                    NCHAR(13) + NCHAR(10) +
-                    N''## Performance Statistics'' + NCHAR(13) + NCHAR(10) + NCHAR(13) + NCHAR(10) +
-                    N''**Executions:** '' + CONVERT(nvarchar(20), qsrs.count_executions) + NCHAR(13) + NCHAR(10) +
-                    N''**First Execution:** '' + CONVERT(nvarchar(50), qsrs.first_execution_time, 127) + NCHAR(13) + NCHAR(10) +
-                    N''**Last Execution:** '' + CONVERT(nvarchar(50), qsrs.last_execution_time, 127) + NCHAR(13) + NCHAR(10) +
-                    N''**Avg Duration (ms):** '' + ISNULL(CONVERT(nvarchar(30), CONVERT(decimal(19,2), qsrs.avg_duration_ms)), N''N/A'') + NCHAR(13) + NCHAR(10) +
-                    N''**Max Duration (ms):** '' + CONVERT(nvarchar(20), qsrs.max_duration_ms) + NCHAR(13) + NCHAR(10) +
-                    N''**Avg CPU Time (ms):** '' + ISNULL(CONVERT(nvarchar(30), CONVERT(decimal(19,2), qsrs.avg_cpu_time_ms)), N''N/A'') + NCHAR(13) + NCHAR(10) +
-                    N''**Max CPU Time (ms):** '' + CONVERT(nvarchar(20), qsrs.max_cpu_time_ms) + NCHAR(13) + NCHAR(10) +
-                    N''**Avg Logical Reads (MB):** '' + ISNULL(CONVERT(nvarchar(30), CONVERT(decimal(19,2), qsrs.avg_logical_io_reads_mb)), N''N/A'') + NCHAR(13) + NCHAR(10) +
-                    N''**Max Logical Reads (MB):** '' + CONVERT(nvarchar(20), qsrs.max_logical_io_reads_mb) + NCHAR(13) + NCHAR(10) +
-                    N''**Avg Logical Writes (MB):** '' + ISNULL(CONVERT(nvarchar(30), CONVERT(decimal(19,2), qsrs.avg_logical_io_writes_mb)), N''N/A'') + NCHAR(13) + NCHAR(10) +
-                    N''**Avg Physical Reads (MB):** '' + ISNULL(CONVERT(nvarchar(30), CONVERT(decimal(19,2), qsrs.avg_physical_io_reads_mb)), N''N/A'') + NCHAR(13) + NCHAR(10) +
-                    N''**Avg Memory Used (MB):** '' + ISNULL(CONVERT(nvarchar(30), CONVERT(decimal(19,2), qsrs.avg_query_max_used_memory_mb)), N''N/A'') + NCHAR(13) + NCHAR(10) +
-                    N''**Avg Rows Returned:** '' + ISNULL(CONVERT(nvarchar(30), CONVERT(decimal(19,2), qsrs.avg_rowcount)), N''N/A'') + NCHAR(13) + NCHAR(10) +
-                    N''**Min DOP:** '' + CONVERT(nvarchar(10), qsrs.min_dop) + NCHAR(13) + NCHAR(10) +
-                    N''**Max DOP:** '' + CONVERT(nvarchar(10), qsrs.max_dop) + NCHAR(13) + NCHAR(10) +
-                    NCHAR(13) + NCHAR(10) +
-                    N''## Wait Statistics'' + NCHAR(13) + NCHAR(10) + NCHAR(13) + NCHAR(10) +'
-            ) +
-            CASE
-                WHEN @new = 1
-                THEN CONVERT
-                     (
-                         nvarchar(max),
-                         N'                    ISNULL(w.top_waits, N''None recorded'') + NCHAR(13) + NCHAR(10) +
-                    NCHAR(13) + NCHAR(10) +'
-                     )
-                ELSE CONVERT
-                     (
-                         nvarchar(max),
-                         N'                    N''Not available (SQL Server pre-2017)'' + NCHAR(13) + NCHAR(10) +
-                    NCHAR(13) + NCHAR(10) +'
-                     )
-            END +
-            CONVERT
-            (
-                nvarchar(max),
-                N'                    N''## Query Text'' + NCHAR(13) + NCHAR(10) + NCHAR(13) + NCHAR(10) +
-                    N''```sql'' + NCHAR(13) + NCHAR(10) +
-                    ISNULL(CONVERT(nvarchar(max), qsqt.query_sql_text), N''N/A'') + NCHAR(13) + NCHAR(10) +
-                    N''```'' + NCHAR(13) + NCHAR(10) + NCHAR(13) + NCHAR(10) +
-                    N''## Query Plan (XML)'' + NCHAR(13) + NCHAR(10) + NCHAR(13) + NCHAR(10) +
-                    N''```xml'' + NCHAR(13) + NCHAR(10) +
-                    ISNULL(qsp.query_plan, N''N/A'') + NCHAR(13) + NCHAR(10) +
-                    N''```''
-            FOR XML
-                PATH(''''),
-                TYPE
-        )'
-            );
-    END;
 
     /*
     Add on the from and stuff
